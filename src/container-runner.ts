@@ -1,8 +1,8 @@
 /**
  * Container Runner for NanoClaw
- * Spawns agent execution in Apple Container and handles IPC
+ * Spawns agent execution in Apple Container or Docker and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, exec, execSync, spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -22,6 +22,32 @@ import { RegisteredGroup } from './types.js';
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+// Detect which container runtime is available
+let _containerRuntime: 'docker' | 'container' | null = null;
+function detectContainerRuntime(): 'docker' | 'container' {
+  if (_containerRuntime) return _containerRuntime;
+
+  try {
+    // Check for Docker first (more common on Linux)
+    execSync('docker info', { stdio: 'ignore', timeout: 3000 });
+    _containerRuntime = 'docker';
+    logger.info('Detected Docker runtime');
+    return 'docker';
+  } catch {
+    // Check for Apple Container
+    try {
+      execSync('container --version', { stdio: 'ignore', timeout: 3000 });
+      _containerRuntime = 'container';
+      logger.info('Detected Apple Container runtime');
+      return 'container';
+    } catch {
+      throw new Error(
+        'No container runtime found. Install Docker or Apple Container.',
+      );
+    }
+  }
+}
 
 function getHomeDir(): string {
   const home = process.env.HOME || os.homedir();
@@ -206,18 +232,31 @@ function buildVolumeMounts(
   return mounts;
 }
 
-function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
+function buildContainerArgs(
+  mounts: VolumeMount[],
+  containerName: string,
+  runtime: 'docker' | 'container',
+): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
-  // Apple Container: --mount for readonly, -v for read-write
+  // Mount syntax differs slightly between runtimes
   for (const mount of mounts) {
-    if (mount.readonly) {
-      args.push(
-        '--mount',
-        `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`,
-      );
+    if (runtime === 'docker') {
+      // Docker uses -v for both, with :ro suffix for readonly
+      const mountStr = mount.readonly
+        ? `${mount.hostPath}:${mount.containerPath}:ro`
+        : `${mount.hostPath}:${mount.containerPath}`;
+      args.push('-v', mountStr);
     } else {
-      args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+      // Apple Container: --mount for readonly, -v for read-write
+      if (mount.readonly) {
+        args.push(
+          '--mount',
+          `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`,
+        );
+      } else {
+        args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+      }
     }
   }
 
@@ -237,10 +276,11 @@ export async function runContainerAgent(
   const groupDir = path.join(GROUPS_DIR, group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
+  const runtime = detectContainerRuntime();
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+  const containerArgs = buildContainerArgs(mounts, containerName, runtime);
 
   logger.debug(
     {
@@ -269,7 +309,7 @@ export async function runContainerAgent(
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
-    const container = spawn('container', containerArgs, {
+    const container = spawn(runtime, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
@@ -373,7 +413,7 @@ export async function runContainerAgent(
     const killOnTimeout = () => {
       timedOut = true;
       logger.error({ group: group.name, containerName }, 'Container timeout, stopping gracefully');
-      exec(`container stop ${containerName}`, { timeout: 15000 }, (err) => {
+      exec(`${runtime} stop ${containerName}`, { timeout: 15000 }, (err) => {
         if (err) {
           logger.warn({ group: group.name, containerName, err }, 'Graceful stop failed, force killing');
           container.kill('SIGKILL');
